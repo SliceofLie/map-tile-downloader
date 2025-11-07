@@ -48,16 +48,18 @@
                 <label for="map_style">Map Style:</label>
                 <select id="map_style" name="map_style"></select><br>
                 <label for="min_zoom">Min Zoom (0-19):</label>
-                <input type="number" id="min_zoom" name="min_zoom" min="0" max="19" value="10" required><br>
+                <input type="number" id="min_zoom" name="min_zoom" min="0" max="19" value="8" required><br>
                 <label for="max_zoom">Max Zoom (0-19):</label>
                 <input type="number" id="max_zoom" name="max_zoom" min="0" max="19" value="12" required><br>
                 <input type="checkbox" id="use_cache" name="use_cache"> Use cached tiles<br>
                 <input type="checkbox" id="convert_to_8bit" checked> Convert to 8 bit for Meshtastic UI Maps<br>
+                <input type="checkbox" id="create_zip" checked> Create ZIP file after download<br>
                 <input type="checkbox" id="view_cached_tiles"> View cached tiles<br>
                 <button type="button" id="downloadBtn">Download Tiles</button>
                 <button type="button" id="downloadWorldBtn">Download World Basemap</button>
                 <button type="button" id="cancelBtn" disabled>Cancel Download</button>
                 <button type="button" id="deleteCacheBtn">Delete Cache</button>
+                <button type="button" id="clearPolygonsBtn">Clear Saved Polygons</button>
             </form>
         </div>
         <div id="progress">Ready</div>
@@ -77,13 +79,45 @@
             navigator.geolocation.getCurrentPosition(function(position) {
                 var lat = position.coords.latitude;
                 var lng = position.coords.longitude;
-                map.setView([lat, lng], 13);
+                setInitialMapView(lat, lng, 13);
             }, function() {
-                map.setView([51.505, -0.09], 13);
+                setInitialMapView(51.505, -0.09, 13);
             });
         } else {
-            map.setView([51.505, -0.09], 13);
+            setInitialMapView(51.505, -0.09, 13);
         }
+
+        // Function to set initial map view, preferring saved position
+        function setInitialMapView(defaultLat, defaultLng, defaultZoom) {
+            var savedPosition = localStorage.getItem('mapPosition');
+            if (savedPosition) {
+                try {
+                    var pos = JSON.parse(savedPosition);
+                    map.setView([pos.lat, pos.lng], pos.zoom);
+                    console.log('Map position restored from localStorage');
+                } catch (e) {
+                    console.error('Error loading saved map position:', e);
+                    map.setView([defaultLat, defaultLng], defaultZoom);
+                }
+            } else {
+                map.setView([defaultLat, defaultLng], defaultZoom);
+            }
+            // Load saved polygons after map is positioned
+            loadPolygonsFromLocalStorage();
+        }
+
+        // Save map position to localStorage whenever map stops moving
+        map.on('moveend', function() {
+            var center = map.getCenter();
+            var zoom = map.getZoom();
+            var position = {
+                lat: center.lat,
+                lng: center.lng,
+                zoom: zoom
+            };
+            localStorage.setItem('mapPosition', JSON.stringify(position));
+            console.log('Map position saved to localStorage');
+        });
 
         // Set up drawing controls
         var drawnItems = new L.FeatureGroup();
@@ -94,13 +128,90 @@
         });
         map.addControl(drawControl);
 
+        // Save polygons to localStorage
+        function savePolygonsToLocalStorage() {
+            var data = drawnItems.toGeoJSON();
+            localStorage.setItem('savedPolygons', JSON.stringify(data));
+            console.log('Polygons saved to localStorage');
+        }
+
+        // Load polygons from localStorage
+        function loadPolygonsFromLocalStorage() {
+            var savedData = localStorage.getItem('savedPolygons');
+            if (savedData) {
+                try {
+                    var geojson = JSON.parse(savedData);
+                    L.geoJSON(geojson, {
+                        onEachFeature: function(feature, layer) {
+                            drawnItems.addLayer(layer);
+                        }
+                    });
+                    document.getElementById('downloadBtn').disabled = drawnItems.getLayers().length === 0;
+                    console.log('Polygons loaded from localStorage');
+                } catch (e) {
+                    console.error('Error loading saved polygons:', e);
+                }
+            }
+        }
+
+        // Save user settings to localStorage
+        function saveSettings() {
+            var settings = {
+                mapStyle: document.getElementById('map_style').value,
+                minZoom: document.getElementById('min_zoom').value,
+                maxZoom: document.getElementById('max_zoom').value,
+                convertTo8bit: document.getElementById('convert_to_8bit').checked,
+                createZip: document.getElementById('create_zip').checked,
+                useCache: document.getElementById('use_cache').checked
+            };
+            localStorage.setItem('userSettings', JSON.stringify(settings));
+            console.log('Settings saved to localStorage');
+        }
+
+        // Load user settings from localStorage
+        function loadSettings() {
+            var savedSettings = localStorage.getItem('userSettings');
+            if (savedSettings) {
+                try {
+                    var settings = JSON.parse(savedSettings);
+                    if (settings.mapStyle) {
+                        document.getElementById('map_style').value = settings.mapStyle;
+                    }
+                    if (settings.minZoom) {
+                        document.getElementById('min_zoom').value = settings.minZoom;
+                    }
+                    if (settings.maxZoom) {
+                        document.getElementById('max_zoom').value = settings.maxZoom;
+                    }
+                    if (settings.convertTo8bit !== undefined) {
+                        document.getElementById('convert_to_8bit').checked = settings.convertTo8bit;
+                    }
+                    if (settings.createZip !== undefined) {
+                        document.getElementById('create_zip').checked = settings.createZip;
+                    }
+                    if (settings.useCache !== undefined) {
+                        document.getElementById('use_cache').checked = settings.useCache;
+                    }
+                    console.log('Settings loaded from localStorage');
+                } catch (e) {
+                    console.error('Error loading saved settings:', e);
+                }
+            }
+        }
+
         map.on('draw:created', function(e) {
             drawnItems.addLayer(e.layer);
             document.getElementById('downloadBtn').disabled = drawnItems.getLayers().length === 0;
+            savePolygonsToLocalStorage();
+        });
+
+        map.on('draw:edited', function(e) {
+            savePolygonsToLocalStorage();
         });
 
         map.on('draw:deleted', function() {
             document.getElementById('downloadBtn').disabled = drawnItems.getLayers().length === 0;
+            savePolygonsToLocalStorage();
         });
 
         // Create layer groups
@@ -157,6 +268,8 @@
                     option.text = name;
                     select.appendChild(option);
                 }
+                // Load saved settings after dropdown is populated
+                loadSettings();
                 updateTileLayer(); // Set initial tile layer
             });
 
@@ -166,8 +279,18 @@
             if (document.getElementById('view_cached_tiles').checked) {
                 showCachedTiles();
             }
+            saveSettings();
         });
-        document.getElementById('use_cache').addEventListener('change', updateTileLayer);
+        document.getElementById('use_cache').addEventListener('change', function() {
+            updateTileLayer();
+            saveSettings();
+        });
+
+        // Save settings when zoom values change
+        document.getElementById('min_zoom').addEventListener('change', saveSettings);
+        document.getElementById('max_zoom').addEventListener('change', saveSettings);
+        document.getElementById('convert_to_8bit').addEventListener('change', saveSettings);
+        document.getElementById('create_zip').addEventListener('change', saveSettings);
 
         // Handle tile download for polygons
         document.getElementById('downloadBtn').addEventListener('click', function() {
@@ -187,7 +310,8 @@
                 min_zoom: parseInt(document.getElementById('min_zoom').value),
                 max_zoom: parseInt(document.getElementById('max_zoom').value),
                 map_style: document.getElementById('map_style').value,
-                convert_to_8bit: document.getElementById('convert_to_8bit').checked
+                convert_to_8bit: document.getElementById('convert_to_8bit').checked,
+                create_zip: document.getElementById('create_zip').checked
             };
             socket.emit('start_download', data);
         });
@@ -196,7 +320,8 @@
         document.getElementById('downloadWorldBtn').addEventListener('click', function() {
             var mapStyleUrl = document.getElementById('map_style').value;
             var convertTo8bit = document.getElementById('convert_to_8bit').checked;
-            socket.emit('start_world_download', {map_style: mapStyleUrl, convert_to_8bit: convertTo8bit});
+            var createZip = document.getElementById('create_zip').checked;
+            socket.emit('start_world_download', {map_style: mapStyleUrl, convert_to_8bit: convertTo8bit, create_zip: createZip});
         });
 
         // Handle cache deletion
@@ -218,6 +343,16 @@
             }
         });
 
+        // Handle clearing saved polygons
+        document.getElementById('clearPolygonsBtn').addEventListener('click', function() {
+            if (confirm('Are you sure you want to clear all saved polygons? This will remove them from the map and localStorage.')) {
+                localStorage.removeItem('savedPolygons');
+                drawnItems.clearLayers();
+                document.getElementById('downloadBtn').disabled = true;
+                alert('Saved polygons cleared');
+            }
+        });
+
         // Handle cancel download
         document.getElementById('cancelBtn').addEventListener('click', function() {
             socket.emit('cancel_download');
@@ -231,22 +366,84 @@
                 cachedTilesLayer.clearLayers();
             }
         });
+        
+        // Update cached tiles display when map moves or zooms (if enabled)
+        map.on('moveend', function() {
+            if (document.getElementById('view_cached_tiles').checked) {
+                showCachedTiles();
+            }
+        });
+        
+        map.on('zoomend', function() {
+            if (document.getElementById('view_cached_tiles').checked) {
+                showCachedTiles();
+            }
+        });
 
-        // Function to show cached tiles
+        // Function to show cached tiles (optimized for current view and zoom)
         function showCachedTiles() {
             cachedTilesLayer.clearLayers();
             var mapStyleSelect = document.getElementById('map_style');
             var styleName = sanitizeStyleName(mapStyleSelect.options[mapStyleSelect.selectedIndex].text);
+            
+            // Get current map state
+            var currentZoom = Math.round(map.getZoom());
+            var bounds = map.getBounds();
+            var mapBounds = {
+                west: bounds.getWest(),
+                south: bounds.getSouth(),
+                east: bounds.getEast(),
+                north: bounds.getNorth()
+            };
+            
             fetch(`/get_cached_tiles/${styleName}`)
                 .then(response => response.json())
                 .then(data => {
-                    data.forEach(function(tile) {
+                    var tilesDrawn = 0;
+                    var maxTilesToDraw = 5000; // Safety limit
+                    
+                    // Filter tiles: only show those at current zoom level ±3 and within/near viewport
+                    var filteredTiles = data.filter(function(tile) {
+                        var z = tile[0], x = tile[1], y = tile[2];
+                        
+                        // Only show tiles at current zoom level or ±3 zoom levels
+                        if (Math.abs(z - currentZoom) > 3) return false;
+                        
+                        // Calculate tile bounds
+                        var topLeft = map.unproject([x * 256, y * 256], z);
+                        var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
+                        
+                        // Check if tile intersects with map viewport (with some padding)
+                        var tileWest = Math.min(topLeft.lng, bottomRight.lng);
+                        var tileEast = Math.max(topLeft.lng, bottomRight.lng);
+                        var tileSouth = Math.min(topLeft.lat, bottomRight.lat);
+                        var tileNorth = Math.max(topLeft.lat, bottomRight.lat);
+                        
+                        // Add padding to viewport to show nearby tiles
+                        var lngPadding = (mapBounds.east - mapBounds.west) * 0.5;
+                        var latPadding = (mapBounds.north - mapBounds.south) * 0.5;
+                        
+                        return (
+                            tileEast >= mapBounds.west - lngPadding &&
+                            tileWest <= mapBounds.east + lngPadding &&
+                            tileNorth >= mapBounds.south - latPadding &&
+                            tileSouth <= mapBounds.north + latPadding
+                        );
+                    });
+                    
+                    // Draw filtered tiles
+                    filteredTiles.forEach(function(tile) {
+                        if (tilesDrawn >= maxTilesToDraw) return;
+                        
                         var z = tile[0], x = tile[1], y = tile[2];
                         var topLeft = map.unproject([x * 256, y * 256], z);
                         var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
                         var bounds = L.latLngBounds(topLeft, bottomRight);
                         L.rectangle(bounds, { color: "#0000ff", weight: 1, fill: false }).addTo(cachedTilesLayer);
+                        tilesDrawn++;
                     });
+                    
+                    console.log(`Showing ${tilesDrawn} cached tiles (filtered from ${data.length} total)`);
                 });
         }
 
@@ -286,7 +483,7 @@
         });
 
         socket.on('tiles_downloaded', function() {
-            document.getElementById('progress').innerHTML += '<br>Tiles downloaded, preparing zip...';
+            document.getElementById('progress').innerHTML += '<br>Tiles downloaded';
         });
 
         socket.on('zipping_started', function() {
@@ -297,7 +494,11 @@
             document.getElementById('cancelBtn').disabled = true;
             downloadProgressLayer.clearLayers();
             document.getElementById('progress').innerHTML = 'Ready';
-            window.location.href = data.zip_url;
+            if (data.zip_url) {
+                window.location.href = data.zip_url;
+            } else {
+                // alert(data.message || 'Tiles cached successfully!');
+            }
         });
 
         socket.on('download_cancelled', function() {
