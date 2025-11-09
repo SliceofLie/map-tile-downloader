@@ -106,18 +106,7 @@
             loadPolygonsFromLocalStorage();
         }
 
-        // Save map position to localStorage whenever map stops moving
-        map.on('moveend', function() {
-            var center = map.getCenter();
-            var zoom = map.getZoom();
-            var position = {
-                lat: center.lat,
-                lng: center.lng,
-                zoom: zoom
-            };
-            localStorage.setItem('mapPosition', JSON.stringify(position));
-            console.log('Map position saved to localStorage');
-        });
+        // Map position saving now handled in the combined moveend handler below
 
         // Set up drawing controls
         var drawnItems = new L.FeatureGroup();
@@ -358,30 +347,60 @@
             socket.emit('cancel_download');
         });
 
+        // Debounce function to limit how often showCachedTiles is called
+        var cachedTilesDebounceTimer = null;
+        var cachedTilesFetchController = null;
+        
+        function debouncedShowCachedTiles() {
+            if (cachedTilesDebounceTimer) {
+                clearTimeout(cachedTilesDebounceTimer);
+            }
+            cachedTilesDebounceTimer = setTimeout(function() {
+                showCachedTiles();
+            }, 300); // Wait 300ms after last move/zoom
+        }
+        
         // Handle view cached tiles checkbox
         document.getElementById('view_cached_tiles').addEventListener('change', function() {
             if (this.checked) {
                 showCachedTiles();
             } else {
                 cachedTilesLayer.clearLayers();
+                if (cachedTilesDebounceTimer) {
+                    clearTimeout(cachedTilesDebounceTimer);
+                }
+                if (cachedTilesFetchController) {
+                    cachedTilesFetchController.abort();
+                }
             }
         });
         
-        // Update cached tiles display when map moves or zooms (if enabled)
+        // Update cached tiles display when map moves (debounced, single handler)
         map.on('moveend', function() {
+            // Save map position
+            var center = map.getCenter();
+            var zoom = map.getZoom();
+            var position = {
+                lat: center.lat,
+                lng: center.lng,
+                zoom: zoom
+            };
+            localStorage.setItem('mapPosition', JSON.stringify(position));
+            
+            // Update cached tiles if enabled (debounced)
             if (document.getElementById('view_cached_tiles').checked) {
-                showCachedTiles();
-            }
-        });
-        
-        map.on('zoomend', function() {
-            if (document.getElementById('view_cached_tiles').checked) {
-                showCachedTiles();
+                debouncedShowCachedTiles();
             }
         });
 
         // Function to show cached tiles (optimized for current view and zoom)
         function showCachedTiles() {
+            // Cancel any pending fetch
+            if (cachedTilesFetchController) {
+                cachedTilesFetchController.abort();
+            }
+            cachedTilesFetchController = new AbortController();
+            
             cachedTilesLayer.clearLayers();
             var mapStyleSelect = document.getElementById('map_style');
             var styleName = sanitizeStyleName(mapStyleSelect.options[mapStyleSelect.selectedIndex].text);
@@ -389,61 +408,60 @@
             // Get current map state
             var currentZoom = Math.round(map.getZoom());
             var bounds = map.getBounds();
-            var mapBounds = {
-                west: bounds.getWest(),
-                south: bounds.getSouth(),
-                east: bounds.getEast(),
-                north: bounds.getNorth()
-            };
             
-            fetch(`/get_cached_tiles/${styleName}`)
+            // Calculate tile bounds for current viewport with padding
+            var padding = 0.5; // 50% padding
+            var west = bounds.getWest();
+            var south = bounds.getSouth();
+            var east = bounds.getEast();
+            var north = bounds.getNorth();
+            var lngPadding = (east - west) * padding;
+            var latPadding = (north - south) * padding;
+            
+            // Calculate min/max tile coordinates at current zoom
+            var nw = L.point(map.project([north + latPadding, west - lngPadding], currentZoom));
+            var se = L.point(map.project([south - latPadding, east + lngPadding], currentZoom));
+            var min_x = Math.floor(nw.x / 256);
+            var max_x = Math.floor(se.x / 256);
+            var min_y = Math.floor(nw.y / 256);
+            var max_y = Math.floor(se.y / 256);
+            
+            // Build query string with backend filtering
+            var queryParams = `?zoom=${currentZoom}&zoom_range=1&min_x=${min_x}&max_x=${max_x}&min_y=${min_y}&max_y=${max_y}`;
+            
+            fetch(`/get_cached_tiles/${styleName}${queryParams}`, { signal: cachedTilesFetchController.signal })
                 .then(response => response.json())
                 .then(data => {
                     var tilesDrawn = 0;
-                    var maxTilesToDraw = 5000; // Safety limit
+                    var maxTilesToDraw = 2000; // Reduced safety limit since we're filtering server-side
                     
-                    // Filter tiles: only show those at current zoom level ±3 and within/near viewport
-                    var filteredTiles = data.filter(function(tile) {
-                        var z = tile[0], x = tile[1], y = tile[2];
-                        
-                        // Only show tiles at current zoom level or ±3 zoom levels
-                        if (Math.abs(z - currentZoom) > 3) return false;
-                        
-                        // Calculate tile bounds
-                        var topLeft = map.unproject([x * 256, y * 256], z);
-                        var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
-                        
-                        // Check if tile intersects with map viewport (with some padding)
-                        var tileWest = Math.min(topLeft.lng, bottomRight.lng);
-                        var tileEast = Math.max(topLeft.lng, bottomRight.lng);
-                        var tileSouth = Math.min(topLeft.lat, bottomRight.lat);
-                        var tileNorth = Math.max(topLeft.lat, bottomRight.lat);
-                        
-                        // Add padding to viewport to show nearby tiles
-                        var lngPadding = (mapBounds.east - mapBounds.west) * 0.5;
-                        var latPadding = (mapBounds.north - mapBounds.south) * 0.5;
-                        
-                        return (
-                            tileEast >= mapBounds.west - lngPadding &&
-                            tileWest <= mapBounds.east + lngPadding &&
-                            tileNorth >= mapBounds.south - latPadding &&
-                            tileSouth <= mapBounds.north + latPadding
-                        );
-                    });
+                    // Batch rectangle creation for better performance
+                    var rectangles = [];
                     
-                    // Draw filtered tiles
-                    filteredTiles.forEach(function(tile) {
+                    data.forEach(function(tile) {
                         if (tilesDrawn >= maxTilesToDraw) return;
                         
                         var z = tile[0], x = tile[1], y = tile[2];
                         var topLeft = map.unproject([x * 256, y * 256], z);
                         var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
                         var bounds = L.latLngBounds(topLeft, bottomRight);
-                        L.rectangle(bounds, { color: "#0000ff", weight: 1, fill: false }).addTo(cachedTilesLayer);
+                        rectangles.push(L.rectangle(bounds, { color: "#0000ff", weight: 1, fill: false }));
                         tilesDrawn++;
                     });
                     
-                    console.log(`Showing ${tilesDrawn} cached tiles (filtered from ${data.length} total)`);
+                    // Add all rectangles at once for better performance
+                    rectangles.forEach(function(rect) {
+                        rect.addTo(cachedTilesLayer);
+                    });
+                    
+                    console.log(`Showing ${tilesDrawn} cached tiles (server-filtered from larger set)`);
+                })
+                .catch(error => {
+                    if (error.name === 'AbortError') {
+                        console.log('Cached tiles fetch aborted');
+                    } else {
+                        console.error('Error fetching cached tiles:', error);
+                    }
                 });
         }
 
@@ -460,22 +478,21 @@
             failedTiles = 0;
             downloadProgressLayer.clearLayers();
             document.getElementById('cancelBtn').disabled = false;
+            document.getElementById('progress').innerHTML = 'Starting download...';
+        });
+        
+        socket.on('download_progress', function(data) {
+            // Update from periodic progress events sent by backend
+            downloadedTiles = data.completed;
+            skippedTiles = data.skipped;
+            failedTiles = data.failed;
+            totalTiles = data.total;
             updateProgress();
         });
 
-        socket.on('tile_downloaded', function(data) {
-            downloadedTiles++;
-            updateProgress();
-            var bounds = [[data.south, data.west], [data.north, data.east]];
-            L.rectangle(bounds, { color: "#ff7800", weight: 1, fill: false }).addTo(downloadProgressLayer);
-        });
-
-        socket.on('tile_skipped', function(data) {
-            skippedTiles++;
-            updateProgress();
-            var bounds = [[data.south, data.west], [data.north, data.east]];
-            L.rectangle(bounds, { color: "#00ff00", weight: 1, fill: false }).addTo(downloadProgressLayer);
-        });
+        // Removed tile_downloaded and tile_skipped socket handlers
+        // These were creating thousands of rectangles causing UI lag
+        // Progress is now tracked via download_progress events only
 
         socket.on('tile_failed', function(data) {
             failedTiles++;

@@ -164,8 +164,6 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
     else:
         normal_tile_path = None
     
-    bounds = mercantile.bounds(tile)
-    
     # Check cache first (check normal cache if converting to 8bit)
     cache_check_path = normal_tile_path if convert_to_8bit and normal_tile_path else tile_path
     if cache_check_path.exists():
@@ -176,12 +174,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
             convert_image_to_8bit(tile_path)
         
         session_obj.update_stats('skipped')
-        socketio.start_background_task(
-            emit_tile_event,
-            'tile_skipped',
-            {'west': bounds.west, 'south': bounds.south, 'east': bounds.east, 'north': bounds.north},
-            session_obj.session_id
-        )
+        # Removed socket emission for skipped tiles - reduces overhead dramatically
         return {'status': 'skipped', 'tile': tile}
     
     # Build URL
@@ -212,10 +205,17 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
                     with open(normal_tile_path, 'wb') as f:
                         f.write(response.content)
                     
-                    # Copy to 8bit location and convert
+                    # Convert in-memory to avoid double I/O
                     tile_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(normal_tile_path, tile_path)
-                    convert_image_to_8bit(tile_path)
+                    try:
+                        img = Image.open(normal_tile_path)
+                        if img.mode != 'P':
+                            img = img.quantize(colors=256)
+                        img.save(tile_path, optimize=True)
+                    except Exception as e:
+                        logging.error(f"Error converting tile to 8-bit: {e}")
+                        # Fallback to copy if conversion fails
+                        shutil.copy2(normal_tile_path, tile_path)
                 else:
                     # Just save normally
                     tile_dir.mkdir(parents=True, exist_ok=True)
@@ -223,12 +223,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
                         f.write(response.content)
                 
                 session_obj.update_stats('completed')
-                socketio.start_background_task(
-                    emit_tile_event,
-                    'tile_downloaded',
-                    {'west': bounds.west, 'south': bounds.south, 'east': bounds.east, 'north': bounds.north},
-                    session_obj.session_id
-                )
+                # Removed socket emission for downloaded tiles - reduces overhead dramatically
                 
                 # Reset rate limit counter on success
                 session_obj.rate_limit_counter = 0
@@ -269,12 +264,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
     
     # All retries failed
     session_obj.update_stats('failed')
-    socketio.start_background_task(
-        emit_tile_event,
-        'tile_failed',
-        {'tile': f"{tile.z}/{tile.x}/{tile.y}"},
-        session_obj.session_id
-    )
+    # Removed socket emission for failed tiles - reduces overhead
     return {'status': 'failed', 'tile': tile}
 
 def emit_tile_event(event_name, data, session_id):
@@ -601,8 +591,16 @@ def delete_cache(style_name):
 
 @app.route('/get_cached_tiles/<style_name>')
 def get_cached_tiles_route(style_name):
-    """Return a list of [z, x, y] for cached tiles of the given style (both 8-bit and normal)."""
-    cached_tiles = []
+    """Return a list of [z, x, y] for cached tiles of the given style, with optional filtering."""
+    # Get optional query parameters for filtering
+    zoom = request.args.get('zoom', type=int)
+    min_x = request.args.get('min_x', type=int)
+    max_x = request.args.get('max_x', type=int)
+    min_y = request.args.get('min_y', type=int)
+    max_y = request.args.get('max_y', type=int)
+    zoom_range = request.args.get('zoom_range', default=1, type=int)  # ±zoom_range
+    
+    cached_tiles = set()  # Use set to avoid duplicates from 8-bit and normal caches
     
     # Check both 8-bit and normal directories
     for convert_to_8bit in [True, False]:
@@ -615,14 +613,33 @@ def get_cached_tiles_route(style_name):
             if z_dir.is_dir():
                 try:
                     z = int(z_dir.name)
+                    
+                    # Filter by zoom level if specified
+                    if zoom is not None and abs(z - zoom) > zoom_range:
+                        continue
+                    
                     for x_dir in z_dir.iterdir():
                         if x_dir.is_dir():
                             try:
                                 x = int(x_dir.name)
+                                
+                                # Filter by x coordinate if specified
+                                if min_x is not None and x < min_x:
+                                    continue
+                                if max_x is not None and x > max_x:
+                                    continue
+                                
                                 for y_file in x_dir.glob('*.png'):
                                     try:
                                         y = int(y_file.stem)
-                                        cached_tiles.append([z, x, y])
+                                        
+                                        # Filter by y coordinate if specified
+                                        if min_y is not None and y < min_y:
+                                            continue
+                                        if max_y is not None and y > max_y:
+                                            continue
+                                        
+                                        cached_tiles.add((z, x, y))
                                     except ValueError:
                                         pass
                             except ValueError:
@@ -630,7 +647,8 @@ def get_cached_tiles_route(style_name):
                 except ValueError:
                     pass
     
-    return jsonify(cached_tiles)
+    # Convert set back to list format
+    return jsonify([[z, x, y] for z, x, y in sorted(cached_tiles)])
 
 if __name__ == '__main__':
     CACHE_DIR.mkdir(exist_ok=True)
