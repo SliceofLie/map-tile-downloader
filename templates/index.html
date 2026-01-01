@@ -39,6 +39,34 @@
             border-radius: 5px;
             box-shadow: 2px 4px 8px rgba(0,0.2,0,0.5);
         }
+        .notification {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.85);
+            color: white;
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 10000;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+        }
+        .notification.show {
+            opacity: 1;
+        }
+        .notification.success {
+            background: rgba(76, 175, 80, 0.95);
+        }
+        .notification.error {
+            background: rgba(244, 67, 54, 0.95);
+        }
+        .notification.info {
+            background: rgba(33, 150, 243, 0.95);
+        }
     </style>
 </head>
 <body>
@@ -76,6 +104,25 @@
             attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
             maxZoom: 19
         }).addTo(map);
+
+        // Notification helper function
+        function showNotification(message, type = 'info', duration = 3000) {
+            var notification = document.createElement('div');
+            notification.className = 'notification ' + type;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+
+            // Trigger reflow to enable transition
+            notification.offsetHeight;
+            notification.classList.add('show');
+
+            setTimeout(function() {
+                notification.classList.remove('show');
+                setTimeout(function() {
+                    document.body.removeChild(notification);
+                }, 300); // Wait for fade out transition
+            }, duration);
+        }
 
         // Set initial view to user's location if possible
         if (navigator.geolocation) {
@@ -271,7 +318,7 @@
             })
             .catch(error => {
                 console.error('Failed to load map sources:', error);
-                alert('Failed to load map sources. Please refresh the page.\n\nError: ' + error.message);
+                showNotification('Failed to load map sources. Please refresh the page. Error: ' + error.message, 'error', 5000);
             });
 
         // Bind updateTileLayer to input changes
@@ -304,7 +351,7 @@
             });
 
             if (polygons.length === 0) {
-                alert('Please draw at least one polygon or rectangle on the map');
+                showNotification('Please draw at least one polygon or rectangle on the map', 'error');
                 return;
             }
 
@@ -313,17 +360,17 @@
 
             // Validate zoom levels
             if (isNaN(minZoom) || isNaN(maxZoom)) {
-                alert('Please enter valid zoom levels');
+                showNotification('Please enter valid zoom levels', 'error');
                 return;
             }
 
             if (minZoom < 0 || minZoom > 19 || maxZoom < 0 || maxZoom > 19) {
-                alert('Zoom levels must be between 0 and 19');
+                showNotification('Zoom levels must be between 0 and 19', 'error');
                 return;
             }
 
             if (minZoom > maxZoom) {
-                alert('Minimum zoom level must be less than or equal to maximum zoom level');
+                showNotification('Minimum zoom level must be less than or equal to maximum zoom level', 'error');
                 return;
             }
 
@@ -361,7 +408,7 @@
 
         // Handle cache deletion
         document.getElementById('deleteCacheBtn').addEventListener('click', function() {
-            if (confirm('Are you sure you want to delete the cached tiles for this style?')) {
+            if (confirm('Are you sure you want to delete the entire tile cache for this map style? This cannot be undone.')) {
                 var mapStyleSelect = document.getElementById('map_style');
                 var styleName = sanitizeStyleName(mapStyleSelect.options[mapStyleSelect.selectedIndex].text);
                 fetch(`/delete_cache/${styleName}`, { method: 'DELETE' })
@@ -372,26 +419,24 @@
                         return response.text();
                     })
                     .then(() => {
-                        alert('Cache deleted successfully');
+                        showNotification('Cache deleted successfully', 'success');
                         if (document.getElementById('view_cached_tiles').checked) {
                             showCachedTiles();
                         }
                     })
                     .catch(error => {
                         console.error('Cache deletion failed:', error);
-                        alert('Failed to delete cache: ' + error.message);
+                        showNotification('Failed to delete cache: ' + error.message, 'error');
                     });
             }
         });
 
         // Handle clearing saved polygons
         document.getElementById('clearPolygonsBtn').addEventListener('click', function() {
-            if (confirm('Are you sure you want to clear all saved polygons? This will remove them from the map and localStorage.')) {
-                localStorage.removeItem('savedPolygons');
-                drawnItems.clearLayers();
-                document.getElementById('downloadBtn').disabled = true;
-                alert('Saved polygons cleared');
-            }
+            localStorage.removeItem('savedPolygons');
+            drawnItems.clearLayers();
+            document.getElementById('downloadBtn').disabled = true;
+            showNotification('Saved polygons cleared', 'success');
         });
 
         // Handle cancel download
@@ -480,7 +525,7 @@
 
             // Build query string - use coordinate filtering only for current zoom
             // For other zoom levels, we'll filter on the frontend
-            var queryParams = `?zoom=${currentZoom}&zoom_range=1&min_x=${min_x}&max_x=${max_x}&min_y=${min_y}&max_y=${max_y}`;
+            var queryParams = `?zoom=${currentZoom}&cache_zoom_range=2&min_x=${min_x}&max_x=${max_x}&min_y=${min_y}&max_y=${max_y}`;
 
             fetch(`/get_cached_tiles/${styleName}${queryParams}`, { signal: cachedTilesFetchController.signal })
                 .then(response => response.json())
@@ -515,30 +560,10 @@
                         var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
                         var rectBounds = L.latLngBounds(topLeft, bottomRight);
 
-                        // Color-code by zoom level relative to current zoom
-                        var zoomDiff = z - currentZoom;
-                        var color, weight, opacity;
-                        if (zoomDiff === 0) {
-                            // Current zoom level - bright blue, thicker
-                            color = "#0000ff";
-                            weight = 2;
-                            opacity = 0.8;
-                        } else if (zoomDiff === -1) {
-                            // One level lower - cyan, medium
-                            color = "#00aaff";
-                            weight = 1.5;
-                            opacity = 0.6;
-                        } else if (zoomDiff === 1) {
-                            // One level higher - purple, medium
-                            color = "#aa00ff";
-                            weight = 1.5;
-                            opacity = 0.6;
-                        } else {
-                            // Other levels - gray, thin
-                            color = "#888888";
-                            weight = 1;
-                            opacity = 0.4;
-                        }
+                        // Use same visual style for all zoom levels
+                        var color = "#0000ff";
+                        var weight = 2;
+                        var opacity = 0.8;
 
                         rectangles.push(L.rectangle(rectBounds, {
                             color: color,
@@ -554,7 +579,7 @@
                         rect.addTo(cachedTilesLayer);
                     });
                     
-                    console.log(`Showing ${tilesDrawn} cached tiles across 3 zoom levels (current zoom: ${currentZoom})`);
+                    console.log(`Showing ${tilesDrawn} cached tiles (zoom ${currentZoom} + 2 deeper levels)`);
                 })
                 .catch(error => {
                     if (error.name === 'AbortError') {
@@ -622,18 +647,18 @@
             document.getElementById('cancelBtn').disabled = true;
             downloadProgressLayer.clearLayers();
             document.getElementById('progress').innerHTML = 'Ready';
-            alert('Download cancelled');
+            showNotification('Download cancelled', 'info');
         });
-        
+
         socket.on('error_image_detected', function(data) {
             document.getElementById('cancelBtn').disabled = true;
             downloadProgressLayer.clearLayers();
             document.getElementById('progress').innerHTML = 'Ready';
-            alert('Download aborted: ' + data.message);
+            showNotification('Download aborted: ' + data.message, 'error', 5000);
         });
 
         socket.on('error', function(data) {
-            alert(data.message);
+            showNotification(data.message, 'error');
         });
 
         function updateProgress() {

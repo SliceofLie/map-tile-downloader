@@ -776,7 +776,7 @@ def get_cached_tiles_route(style_name):
     max_x = request.args.get('max_x', type=int)
     min_y = request.args.get('min_y', type=int)
     max_y = request.args.get('max_y', type=int)
-    zoom_range = request.args.get('zoom_range', default=1, type=int)  # ±zoom_range
+    cache_zoom_range = request.args.get('cache_zoom_range', default=1, type=int)  # Current + N deeper levels
     
     cached_tiles = set()  # Use set to avoid duplicates from 8-bit and normal caches
     
@@ -793,10 +793,10 @@ def get_cached_tiles_route(style_name):
                     z = int(z_dir.name)
                     
                     # Filter by zoom level if specified
-                    # zoom_range parameter means "show tiles within ±zoom_range levels"
-                    # For zoom_range=1: shows current zoom ±1 (3 levels total)
-                    # For zoom_range=0: shows only current zoom (1 level)
-                    if zoom is not None and abs(z - zoom) > zoom_range:
+                    # cache_zoom_range parameter: show current zoom + cache_zoom_range deeper levels
+                    # For cache_zoom_range=2: shows zoom, zoom+1, zoom+2 (3 levels total)
+                    # For cache_zoom_range=0: shows only current zoom (1 level)
+                    if zoom is not None and (z < zoom or z > zoom + cache_zoom_range):
                         continue
                     
                     for x_dir in z_dir.iterdir():
@@ -804,22 +804,23 @@ def get_cached_tiles_route(style_name):
                             try:
                                 x = int(x_dir.name)
                                 
-                                # Filter by x coordinate if specified
-                                if min_x is not None and x < min_x:
+                                # Filter by x coordinate if specified (ONLY for current zoom level)
+                                # For other zoom levels, frontend will filter by viewport
+                                if z == zoom and min_x is not None and x < min_x:
                                     continue
-                                if max_x is not None and x > max_x:
+                                if z == zoom and max_x is not None and x > max_x:
                                     continue
-                                
+
                                 for y_file in x_dir.glob('*.png'):
                                     try:
                                         y = int(y_file.stem)
-                                        
-                                        # Filter by y coordinate if specified
-                                        if min_y is not None and y < min_y:
+
+                                        # Filter by y coordinate if specified (ONLY for current zoom level)
+                                        if z == zoom and min_y is not None and y < min_y:
                                             continue
-                                        if max_y is not None and y > max_y:
+                                        if z == zoom and max_y is not None and y > max_y:
                                             continue
-                                        
+
                                         cached_tiles.add((z, x, y))
                                     except ValueError:
                                         pass

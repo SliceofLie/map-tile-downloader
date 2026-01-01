@@ -1,5 +1,4 @@
 {
-  "Standard OSM": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
   "OpenTopoMap Outdoors": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
   "CartoDB Positron": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
   "CartoDB Dark Matter": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
