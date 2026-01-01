@@ -832,6 +832,24 @@ def get_cached_tiles_route(style_name):
     # Convert set back to list format
     return jsonify([[z, x, y] for z, x, y in sorted(cached_tiles)])
 
+@app.route('/estimate_tile_count', methods=['POST'])
+def estimate_tile_count():
+    """Calculate the exact number of tiles that will be downloaded for given polygons and zoom range."""
+    data = request.get_json()
+    polygons_data = data.get('polygons', [])
+    min_zoom = data.get('min_zoom', 0)
+    max_zoom = data.get('max_zoom', 0)
+
+    if not polygons_data:
+        return jsonify({'count': 0})
+
+    try:
+        tiles = get_tiles_for_polygons(polygons_data, min_zoom, max_zoom)
+        return jsonify({'count': len(tiles)})
+    except Exception as e:
+        logging.error(f"Error estimating tile count: {e}")
+        return jsonify({'count': 0, 'error': str(e)}), 500
+
 if __name__ == '__main__':
     CACHE_DIR.mkdir(exist_ok=True)
     CONFIG_DIR.mkdir(exist_ok=True)

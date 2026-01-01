@@ -374,28 +374,48 @@
                 return;
             }
 
-            // Estimate tile count to warn user about large downloads
-            var estimatedTiles = 0;
-            for (var z = minZoom; z <= maxZoom; z++) {
-                estimatedTiles += Math.pow(4, z - minZoom);
-            }
-            estimatedTiles *= polygons.length; // Rough estimate
+            // Show calculating status
+            document.getElementById('progress').innerHTML = 'Calculating tiles...';
 
-            if (estimatedTiles > 10000) {
-                if (!confirm('This may download approximately ' + estimatedTiles.toLocaleString() + ' tiles. This could take a while. Continue?')) {
-                    return;
+            // Get exact tile count from backend
+            fetch('/estimate_tile_count', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    polygons: polygons,
+                    min_zoom: minZoom,
+                    max_zoom: maxZoom
+                })
+            })
+            .then(response => response.json())
+            .then(result => {
+                var tileCount = result.count;
+
+                // Reset status
+                document.getElementById('progress').innerHTML = 'Ready';
+
+                if (tileCount > 10000) {
+                    if (!confirm('This will download exactly ' + tileCount.toLocaleString() + ' tiles. This could take a while. Continue?')) {
+                        return;
+                    }
                 }
-            }
 
-            var data = {
-                polygons: polygons,
-                min_zoom: minZoom,
-                max_zoom: maxZoom,
-                map_style: document.getElementById('map_style').value,
-                convert_to_8bit: document.getElementById('convert_to_8bit').checked,
-                create_zip: document.getElementById('create_zip').checked
-            };
-            socket.emit('start_download', data);
+                // Proceed with download
+                var data = {
+                    polygons: polygons,
+                    min_zoom: minZoom,
+                    max_zoom: maxZoom,
+                    map_style: document.getElementById('map_style').value,
+                    convert_to_8bit: document.getElementById('convert_to_8bit').checked,
+                    create_zip: document.getElementById('create_zip').checked
+                };
+                socket.emit('start_download', data);
+            })
+            .catch(error => {
+                console.error('Error estimating tiles:', error);
+                document.getElementById('progress').innerHTML = 'Ready';
+                showNotification('Error estimating tile count: ' + error.message, 'error');
+            });
         });
 
         // Handle world basemap download
