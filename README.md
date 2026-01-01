@@ -60,7 +60,7 @@ Adding a New Map Source: Simply add a new key-value pair to the JSON file with t
 	- Alternatively you may create a Batch file "StartMap.bat" to launch from windows:
  - 		@echo off
 		cd /d C:\(extractlocation)\map-tile-downloader
-		python scr/TileDL.py
+		python src/TileDL.py
 		pause
 
 3. 	Access the Web Interface:

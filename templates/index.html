@@ -18,21 +18,22 @@
             height: 100vh;
             width: 100%;
         }
-        .form-container {
+        .controls-wrapper {
             position: absolute;
             top: 8px;
             right: 10px;
             z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .form-container {
             background: rgba(234, 233, 233, 0.822);
             padding: 10px;
             border-radius: 8px;
             box-shadow: 0 0 10px rgba(0,0,0,0.5);
         }
         #progress {
-            position: absolute;
-            top: 188px;
-            right: 11px;
-            z-index: 1000;
             background: rgba(241, 242, 243, 0.736);
             padding: 10px;
             border-radius: 5px;
@@ -43,26 +44,28 @@
 <body>
     <div style="position: relative;">
         <div id="map"></div>
-        <div class="form-container">
-            <form id="downloadForm">
-                <label for="map_style">Map Style:</label>
-                <select id="map_style" name="map_style"></select><br>
-                <label for="min_zoom">Min Zoom (0-19):</label>
-                <input type="number" id="min_zoom" name="min_zoom" min="0" max="19" value="8" required><br>
-                <label for="max_zoom">Max Zoom (0-19):</label>
-                <input type="number" id="max_zoom" name="max_zoom" min="0" max="19" value="12" required><br>
-                <input type="checkbox" id="use_cache" name="use_cache"> Use cached tiles<br>
-                <input type="checkbox" id="convert_to_8bit" checked> Convert to 8 bit for Meshtastic UI Maps<br>
-                <input type="checkbox" id="create_zip" checked> Create ZIP file after download<br>
-                <input type="checkbox" id="view_cached_tiles"> View cached tiles<br>
-                <button type="button" id="downloadBtn">Download Tiles</button>
-                <button type="button" id="downloadWorldBtn">Download World Basemap</button>
-                <button type="button" id="cancelBtn" disabled>Cancel Download</button>
-                <button type="button" id="deleteCacheBtn">Delete Cache</button>
-                <button type="button" id="clearPolygonsBtn">Clear Saved Polygons</button>
-            </form>
+        <div class="controls-wrapper">
+            <div class="form-container">
+                <form id="downloadForm">
+                    <label for="map_style">Map Style:</label>
+                    <select id="map_style" name="map_style"></select><br>
+                    <label for="min_zoom">Min Zoom (0-19):</label>
+                    <input type="number" id="min_zoom" name="min_zoom" min="0" max="19" value="8" required><br>
+                    <label for="max_zoom">Max Zoom (0-19):</label>
+                    <input type="number" id="max_zoom" name="max_zoom" min="0" max="19" value="12" required><br>
+                    <input type="checkbox" id="use_cache" name="use_cache"> Use cached tiles<br>
+                    <input type="checkbox" id="convert_to_8bit" checked> Convert to 8 bit for Meshtastic UI Maps<br>
+                    <input type="checkbox" id="create_zip" checked> Create ZIP file after download<br>
+                    <input type="checkbox" id="view_cached_tiles"> View cached tiles<br>
+                    <button type="button" id="downloadBtn">Download Tiles</button>
+                    <button type="button" id="downloadWorldBtn">Download World Basemap</button>
+                    <button type="button" id="cancelBtn" disabled>Cancel Download</button>
+                    <button type="button" id="deleteCacheBtn">Delete Cache</button>
+                    <button type="button" id="clearPolygonsBtn">Clear Saved Polygons</button>
+                </form>
+            </div>
+            <div id="progress">Ready</div>
         </div>
-        <div id="progress">Ready</div>
     </div>
 
     <script>
@@ -248,7 +251,12 @@
 
         // Populate map style dropdown from server
         fetch('/get_map_sources')
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                return response.json();
+            })
             .then(data => {
                 var select = document.getElementById('map_style');
                 for (var name in data) {
@@ -260,6 +268,10 @@
                 // Load saved settings after dropdown is populated
                 loadSettings();
                 updateTileLayer(); // Set initial tile layer
+            })
+            .catch(error => {
+                console.error('Failed to load map sources:', error);
+                alert('Failed to load map sources. Please refresh the page.\n\nError: ' + error.message);
             });
 
         // Bind updateTileLayer to input changes
@@ -290,14 +302,48 @@
                     polygons.push(latlngs.map(function(latlng) { return [latlng.lat, latlng.lng]; }));
                 }
             });
+
             if (polygons.length === 0) {
-                alert('Please draw at least one shape.');
+                alert('Please draw at least one polygon or rectangle on the map');
                 return;
             }
+
+            var minZoom = parseInt(document.getElementById('min_zoom').value);
+            var maxZoom = parseInt(document.getElementById('max_zoom').value);
+
+            // Validate zoom levels
+            if (isNaN(minZoom) || isNaN(maxZoom)) {
+                alert('Please enter valid zoom levels');
+                return;
+            }
+
+            if (minZoom < 0 || minZoom > 19 || maxZoom < 0 || maxZoom > 19) {
+                alert('Zoom levels must be between 0 and 19');
+                return;
+            }
+
+            if (minZoom > maxZoom) {
+                alert('Minimum zoom level must be less than or equal to maximum zoom level');
+                return;
+            }
+
+            // Estimate tile count to warn user about large downloads
+            var estimatedTiles = 0;
+            for (var z = minZoom; z <= maxZoom; z++) {
+                estimatedTiles += Math.pow(4, z - minZoom);
+            }
+            estimatedTiles *= polygons.length; // Rough estimate
+
+            if (estimatedTiles > 10000) {
+                if (!confirm('This may download approximately ' + estimatedTiles.toLocaleString() + ' tiles. This could take a while. Continue?')) {
+                    return;
+                }
+            }
+
             var data = {
                 polygons: polygons,
-                min_zoom: parseInt(document.getElementById('min_zoom').value),
-                max_zoom: parseInt(document.getElementById('max_zoom').value),
+                min_zoom: minZoom,
+                max_zoom: maxZoom,
                 map_style: document.getElementById('map_style').value,
                 convert_to_8bit: document.getElementById('convert_to_8bit').checked,
                 create_zip: document.getElementById('create_zip').checked
@@ -320,14 +366,20 @@
                 var styleName = sanitizeStyleName(mapStyleSelect.options[mapStyleSelect.selectedIndex].text);
                 fetch(`/delete_cache/${styleName}`, { method: 'DELETE' })
                     .then(response => {
-                        if (response.ok) {
-                            alert('Cache deleted successfully');
-                            if (document.getElementById('view_cached_tiles').checked) {
-                                showCachedTiles();
-                            }
-                        } else {
-                            alert('Failed to delete cache');
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
                         }
+                        return response.text();
+                    })
+                    .then(() => {
+                        alert('Cache deleted successfully');
+                        if (document.getElementById('view_cached_tiles').checked) {
+                            showCachedTiles();
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Cache deletion failed:', error);
+                        alert('Failed to delete cache: ' + error.message);
                     });
             }
         });
@@ -408,7 +460,7 @@
             // Get current map state
             var currentZoom = Math.round(map.getZoom());
             var bounds = map.getBounds();
-            
+
             // Calculate tile bounds for current viewport with padding
             var padding = 0.5; // 50% padding
             var west = bounds.getWest();
@@ -417,7 +469,7 @@
             var north = bounds.getNorth();
             var lngPadding = (east - west) * padding;
             var latPadding = (north - south) * padding;
-            
+
             // Calculate min/max tile coordinates at current zoom
             var nw = L.point(map.project([north + latPadding, west - lngPadding], currentZoom));
             var se = L.point(map.project([south - latPadding, east + lngPadding], currentZoom));
@@ -425,27 +477,75 @@
             var max_x = Math.floor(se.x / 256);
             var min_y = Math.floor(nw.y / 256);
             var max_y = Math.floor(se.y / 256);
-            
-            // Build query string with backend filtering
+
+            // Build query string - use coordinate filtering only for current zoom
+            // For other zoom levels, we'll filter on the frontend
             var queryParams = `?zoom=${currentZoom}&zoom_range=1&min_x=${min_x}&max_x=${max_x}&min_y=${min_y}&max_y=${max_y}`;
-            
+
             fetch(`/get_cached_tiles/${styleName}${queryParams}`, { signal: cachedTilesFetchController.signal })
                 .then(response => response.json())
                 .then(data => {
                     var tilesDrawn = 0;
-                    var maxTilesToDraw = 2000; // Reduced safety limit since we're filtering server-side
-                    
+                    var maxTilesToDraw = 2000;
+
+                    // Get viewport bounds with padding for filtering other zoom levels
+                    var viewBounds = map.getBounds().pad(1.0);
+
                     // Batch rectangle creation for better performance
                     var rectangles = [];
-                    
+
                     data.forEach(function(tile) {
                         if (tilesDrawn >= maxTilesToDraw) return;
-                        
+
                         var z = tile[0], x = tile[1], y = tile[2];
+
+                        // For tiles not at current zoom, check if they're in viewport
+                        if (z !== currentZoom) {
+                            var topLeft = map.unproject([x * 256, y * 256], z);
+                            var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
+                            var tileBounds = L.latLngBounds(topLeft, bottomRight);
+
+                            if (!viewBounds.intersects(tileBounds)) {
+                                return; // Skip tiles outside viewport for non-current zoom levels
+                            }
+                        }
+
+                        // Now create the rectangle for display
                         var topLeft = map.unproject([x * 256, y * 256], z);
                         var bottomRight = map.unproject([(x + 1) * 256, (y + 1) * 256], z);
-                        var bounds = L.latLngBounds(topLeft, bottomRight);
-                        rectangles.push(L.rectangle(bounds, { color: "#0000ff", weight: 1, fill: false }));
+                        var rectBounds = L.latLngBounds(topLeft, bottomRight);
+
+                        // Color-code by zoom level relative to current zoom
+                        var zoomDiff = z - currentZoom;
+                        var color, weight, opacity;
+                        if (zoomDiff === 0) {
+                            // Current zoom level - bright blue, thicker
+                            color = "#0000ff";
+                            weight = 2;
+                            opacity = 0.8;
+                        } else if (zoomDiff === -1) {
+                            // One level lower - cyan, medium
+                            color = "#00aaff";
+                            weight = 1.5;
+                            opacity = 0.6;
+                        } else if (zoomDiff === 1) {
+                            // One level higher - purple, medium
+                            color = "#aa00ff";
+                            weight = 1.5;
+                            opacity = 0.6;
+                        } else {
+                            // Other levels - gray, thin
+                            color = "#888888";
+                            weight = 1;
+                            opacity = 0.4;
+                        }
+
+                        rectangles.push(L.rectangle(rectBounds, {
+                            color: color,
+                            weight: weight,
+                            opacity: opacity,
+                            fill: false
+                        }));
                         tilesDrawn++;
                     });
                     
@@ -454,7 +554,7 @@
                         rect.addTo(cachedTilesLayer);
                     });
                     
-                    console.log(`Showing ${tilesDrawn} cached tiles (server-filtered from larger set)`);
+                    console.log(`Showing ${tilesDrawn} cached tiles across 3 zoom levels (current zoom: ${currentZoom})`);
                 })
                 .catch(error => {
                     if (error.name === 'AbortError') {

@@ -66,8 +66,8 @@ class DownloadSession:
     """Manages state for a single download session."""
     def __init__(self, session_id):
         self.session_id = session_id
-        self.cancel_event = threading.Event()
-        self.cancel_event.set()  # Start as not cancelled
+        self.cancel_event = threading.Event()  # Start cleared (not cancelled)
+        self.active = True  # Track if session is still active
         self.stats_lock = threading.Lock()
         self.stats = {
             'total': 0,
@@ -80,14 +80,17 @@ class DownloadSession:
         self.currently_throttled = False
         self.error_image_detected = False
         self.error_message = None
-        
+
     def is_cancelled(self):
-        return not self.cancel_event.is_set()
-    
+        """Check if download has been cancelled."""
+        return self.cancel_event.is_set()  # Set = cancelled (standard semantics)
+
     def cancel(self, error_message=None):
-        self.cancel_event.clear()
+        """Cancel this download session."""
+        self.cancel_event.set()  # Set the event to signal cancellation
         if error_message:
             self.error_message = error_message
+        logging.info(f"Session {self.session_id} cancelled")
     
     def update_stats(self, stat_type, count=1):
         with self.stats_lock:
@@ -105,10 +108,11 @@ def get_session(session_id):
         return sessions[session_id]
 
 def cleanup_session(session_id):
-    """Remove session when done."""
+    """Mark session as inactive (but don't delete immediately)."""
     with sessions_lock:
         if session_id in sessions:
-            del sessions[session_id]
+            sessions[session_id].active = False
+            logging.info(f"Session {session_id} marked inactive")
 
 def create_requests_session():
     """Create a requests session with connection pooling and retry logic."""
@@ -152,13 +156,17 @@ def get_style_cache_dir(style_name, convert_to_8bit=False):
 
 def convert_image_to_8bit(tile_path):
     """Convert image to 8-bit palette mode if needed."""
+    img = None
     try:
-        with Image.open(tile_path) as img:
-            if img.mode != 'P':
-                img = img.quantize(colors=256)
-                img.save(tile_path, optimize=True)
+        img = Image.open(tile_path)
+        if img.mode != 'P':
+            img = img.quantize(colors=256)
+        img.save(tile_path, optimize=True)
     except Exception as e:
         logging.error(f"Error converting tile to 8-bit: {e}")
+    finally:
+        if img:
+            img.close()
 
 def calculate_file_hash(file_path):
     """Calculate MD5 hash of a file."""
@@ -200,17 +208,33 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
         normal_tile_path = None
     
     # Check cache first (check normal cache if converting to 8bit)
+    # Use try-except instead of check-then-act to avoid TOCTOU race
     cache_check_path = normal_tile_path if convert_to_8bit and normal_tile_path else tile_path
-    if cache_check_path.exists():
-        # If we need 8bit version but don't have it yet, convert from normal
-        if convert_to_8bit and not tile_path.exists():
-            tile_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cache_check_path, tile_path)
-            convert_image_to_8bit(tile_path)
-        
-        session_obj.update_stats('skipped')
-        # Removed socket emission for skipped tiles - reduces overhead dramatically
-        return {'status': 'skipped', 'tile': tile}
+
+    try:
+        if cache_check_path.exists():
+            # If we need 8bit version but don't have it yet, convert from normal
+            if convert_to_8bit and cache_check_path == normal_tile_path:
+                try:
+                    tile_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cache_check_path, tile_path)
+                    convert_image_to_8bit(tile_path)
+                except FileNotFoundError:
+                    logging.debug(f"Cache file disappeared during copy: {cache_check_path}")
+                    # Fall through to download
+                except Exception as e:
+                    logging.warning(f"Cache conversion failed: {e}, will re-download")
+                    # Fall through to download
+                else:
+                    session_obj.update_stats('skipped')
+                    return {'status': 'skipped', 'tile': tile}
+            else:
+                # Direct cache hit
+                session_obj.update_stats('skipped')
+                return {'status': 'skipped', 'tile': tile}
+    except Exception as e:
+        logging.debug(f"Cache check failed: {e}, proceeding to download")
+        # Fall through to download
     
     # Build URL
     subdomain = random.choice(['a', 'b', 'c']) if '{s}' in map_style else ''
@@ -232,25 +256,35 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
         
         try:
             response = http_session.get(url, timeout=15)
-            
+
             if response.status_code == 200:
+                # Validate response is actually an image
+                content_type = response.headers.get('Content-Type', '')
+                if not content_type.startswith('image/'):
+                    logging.warning(f"Invalid content type '{content_type}' for tile {tile} (expected image/*)")
+                    return {'status': 'failed', 'tile': tile}
                 # Always save to normal cache first
                 if convert_to_8bit and normal_tile_path:
                     normal_tile_dir.mkdir(parents=True, exist_ok=True)
-                    with open(normal_tile_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    # Check for error image before processing
-                    if check_for_error_image(normal_tile_path, session_obj):
-                        # Delete the error image and return error status
-                        try:
-                            os.remove(normal_tile_path)
-                        except:
-                            pass
-                        return {'status': 'error_image', 'tile': tile}
+                    try:
+                        with open(normal_tile_path, 'wb') as f:
+                            f.write(response.content)
+
+                        # Check for error image before processing
+                        if check_for_error_image(normal_tile_path, session_obj):
+                            # Delete the error image and return error status
+                            try:
+                                os.remove(normal_tile_path)
+                            except OSError as e:
+                                logging.warning(f"Failed to remove error image {normal_tile_path}: {e}")
+                            return {'status': 'error_image', 'tile': tile}
+                    except IOError as e:
+                        logging.error(f"Failed to write tile {tile}: {e}")
+                        return {'status': 'failed', 'tile': tile}
                     
                     # Convert in-memory to avoid double I/O
                     tile_dir.mkdir(parents=True, exist_ok=True)
+                    img = None
                     try:
                         img = Image.open(normal_tile_path)
                         if img.mode != 'P':
@@ -260,20 +294,27 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
                         logging.error(f"Error converting tile to 8-bit: {e}")
                         # Fallback to copy if conversion fails
                         shutil.copy2(normal_tile_path, tile_path)
+                    finally:
+                        if img:
+                            img.close()
                 else:
                     # Just save normally
                     tile_dir.mkdir(parents=True, exist_ok=True)
-                    with open(tile_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    # Check for error image
-                    if check_for_error_image(tile_path, session_obj):
-                        # Delete the error image and return error status
-                        try:
-                            os.remove(tile_path)
-                        except:
-                            pass
-                        return {'status': 'error_image', 'tile': tile}
+                    try:
+                        with open(tile_path, 'wb') as f:
+                            f.write(response.content)
+
+                        # Check for error image
+                        if check_for_error_image(tile_path, session_obj):
+                            # Delete the error image and return error status
+                            try:
+                                os.remove(tile_path)
+                            except OSError as e:
+                                logging.warning(f"Failed to remove error image {tile_path}: {e}")
+                            return {'status': 'error_image', 'tile': tile}
+                    except IOError as e:
+                        logging.error(f"Failed to write tile {tile}: {e}")
+                        return {'status': 'failed', 'tile': tile}
                 
                 session_obj.update_stats('completed')
                 # Removed socket emission for downloaded tiles - reduces overhead dramatically
@@ -378,48 +419,68 @@ def download_tiles_optimized(tiles, map_style, style_cache_dir, convert_to_8bit,
     # Process tiles in batches with increased parallelism
     retry_queue = deque()
     progress_counter = 0
+    progress_lock = threading.Lock()  # Lock for thread-safe progress counter
     progress_update_interval = 50  # Update progress every N tiles
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit initial batch
-        futures = {}
-        for tile in tiles:
-            if session_obj.is_cancelled():
-                break
-            future = executor.submit(
-                download_tile,
-                tile,
-                map_style,
-                style_cache_dir,
-                convert_to_8bit,
-                session_obj,
-                get_thread_session(),
-                normal_cache_dir
-            )
-            futures[future] = tile
-        
-        # Process results and handle retries
-        for future in as_completed(futures):
-            if session_obj.is_cancelled():
-                break
-            
-            result = future.result()
-            
-            # Check for error image detection
-            if result['status'] == 'error_image':
-                logging.error(f"Error image detected at tile {result['tile'].z}/{result['tile'].x}/{result['tile'].y}")
-                # Cancel all remaining downloads
-                session_obj.cancel(session_obj.error_message)
-                break
-            
-            # Queue failed downloads for retry
-            if result['status'] == 'failed' and len(retry_queue) < 1000:  # Limit retry queue size
-                retry_queue.append(result['tile'])
-            
-            # Periodic progress updates
-            progress_counter += 1
-            if progress_counter % progress_update_interval == 0:
-                emit_progress_update(session_obj)
+
+    all_futures = []  # Track all futures for potential cancellation
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit initial batch
+            futures = {}
+            for tile in tiles:
+                if session_obj.is_cancelled():
+                    # Cancel all pending futures before breaking
+                    for future in all_futures:
+                        future.cancel()
+                    logging.info(f"Cancelled {len(all_futures)} pending futures")
+                    break
+                future = executor.submit(
+                    download_tile,
+                    tile,
+                    map_style,
+                    style_cache_dir,
+                    convert_to_8bit,
+                    session_obj,
+                    get_thread_session(),
+                    normal_cache_dir
+                )
+                futures[future] = tile
+                all_futures.append(future)
+
+            # Process results and handle retries
+            for future in as_completed(futures):
+                if session_obj.is_cancelled():
+                    # Cancel remaining futures
+                    for f in all_futures:
+                        f.cancel()
+                    break
+
+                result = future.result()
+
+                # Check for error image detection
+                if result['status'] == 'error_image':
+                    logging.error(f"Error image detected at tile {result['tile'].z}/{result['tile'].x}/{result['tile'].y}")
+                    # Cancel all remaining downloads
+                    session_obj.cancel(session_obj.error_message)
+                    for f in all_futures:
+                        f.cancel()
+                    break
+
+                # Queue failed downloads for retry
+                if result['status'] == 'failed' and len(retry_queue) < 1000:  # Limit retry queue size
+                    retry_queue.append(result['tile'])
+
+                # Periodic progress updates with thread-safe counter
+                should_emit_progress = False
+                with progress_lock:
+                    progress_counter += 1
+                    if progress_counter % progress_update_interval == 0:
+                        should_emit_progress = True
+
+                if should_emit_progress:
+                    emit_progress_update(session_obj)
+    finally:
+        logging.debug(f"ThreadPoolExecutor cleanup complete")
         
         # Process retry queue if not cancelled
         if not session_obj.is_cancelled() and retry_queue:
@@ -497,44 +558,65 @@ def handle_disconnect():
 def handle_start_download(data):
     """Handle download request for tiles within polygons."""
     session_id = request.sid
-    
+
     try:
-        polygons_data = data['polygons']
-        min_zoom = data['min_zoom']
-        max_zoom = data['max_zoom']
-        map_style_url = data['map_style']
+        # Validate required fields exist
+        polygons_data = data.get('polygons')
+        min_zoom = data.get('min_zoom')
+        max_zoom = data.get('max_zoom')
+        map_style_url = data.get('map_style')
         convert_to_8bit = data.get('convert_to_8bit', False)
         create_zip_file = data.get('create_zip', True)
-        
+
+        # Validate polygons
+        if not polygons_data:
+            emit('error', {'message': 'No polygons provided'})
+            return
+
+        if not isinstance(polygons_data, list) or len(polygons_data) == 0:
+            emit('error', {'message': 'Invalid polygons data format'})
+            return
+
+        # Validate each polygon has at least 3 points
+        for i, poly in enumerate(polygons_data):
+            if not isinstance(poly, list) or len(poly) < 3:
+                emit('error', {'message': f'Polygon {i+1} must have at least 3 points'})
+                return
+
+        # Validate zoom levels
+        try:
+            min_zoom = int(min_zoom)
+            max_zoom = int(max_zoom)
+            if not (0 <= min_zoom <= 19 and 0 <= max_zoom <= 19):
+                raise ValueError("Zoom levels must be 0-19")
+            if min_zoom > max_zoom:
+                raise ValueError("Min zoom must be <= max zoom")
+        except (ValueError, TypeError) as e:
+            emit('error', {'message': f'Invalid zoom levels: {e}'})
+            return
+
+        # Validate map style
         style_name = next((name for name, url in MAP_SOURCES.items() if url == map_style_url), None)
         if not style_name:
             emit('error', {'message': 'Invalid map style'})
             return
-        
+
         style_cache_dir = get_style_cache_dir(style_name, convert_to_8bit)
-        
+
         # If converting to 8bit, also get normal cache directory
         normal_cache_dir = get_style_cache_dir(style_name, False) if convert_to_8bit else None
-        
-        if min_zoom < 0 or max_zoom > 19 or min_zoom > max_zoom:
-            emit('error', {'message': 'Invalid zoom range (must be 0-19, min <= max)'})
-            return
-        
-        if not polygons_data:
-            emit('error', {'message': 'No polygons provided'})
-            return
-        
+
         tiles = get_tiles_for_polygons(polygons_data, min_zoom, max_zoom)
-        
+
         # Create/reset session
         session_obj = get_session(session_id)
-        session_obj.cancel_event.set()  # Ensure not cancelled
+        session_obj.cancel_event.clear()  # Clear event (not cancelled)
         session_obj.stats = {'total': 0, 'completed': 0, 'skipped': 0, 'failed': 0, 'rate_limited': 0}
         
         def download_task():
             try:
                 download_tiles_optimized(tiles, map_style_url, style_cache_dir, convert_to_8bit, session_obj, normal_cache_dir)
-                
+
                 if not session_obj.is_cancelled():
                     if create_zip_file:
                         zip_path = create_zip(style_cache_dir, style_name)
@@ -543,6 +625,16 @@ def handle_start_download(data):
                     else:
                         with app.app_context():
                             socketio.emit('download_complete', {'zip_url': None, 'message': 'Tiles cached successfully'}, to=session_id)
+
+            except Exception as e:
+                logging.error(f"Download task failed for session {session_id}: {e}", exc_info=True)
+                try:
+                    with app.app_context():
+                        socketio.emit('error', {
+                            'message': f'Download failed: {str(e)}'
+                        }, to=session_id)
+                except Exception as emit_err:
+                    logging.error(f"Failed to emit error to client: {emit_err}")
             finally:
                 cleanup_session(session_id)
         
@@ -581,7 +673,7 @@ def handle_start_world_download(data):
         def download_task():
             try:
                 download_tiles_optimized(tiles, map_style_url, style_cache_dir, convert_to_8bit, session_obj, normal_cache_dir)
-                
+
                 if not session_obj.is_cancelled():
                     if create_zip_file:
                         zip_path = create_zip(style_cache_dir, style_name)
@@ -590,6 +682,16 @@ def handle_start_world_download(data):
                     else:
                         with app.app_context():
                             socketio.emit('download_complete', {'zip_url': None, 'message': 'Tiles cached successfully'}, to=session_id)
+
+            except Exception as e:
+                logging.error(f"Download task failed for session {session_id}: {e}", exc_info=True)
+                try:
+                    with app.app_context():
+                        socketio.emit('error', {
+                            'message': f'Download failed: {str(e)}'
+                        }, to=session_id)
+                except Exception as emit_err:
+                    logging.error(f"Failed to emit error to client: {emit_err}")
             finally:
                 cleanup_session(session_id)
         
@@ -624,14 +726,22 @@ def download_zip():
 @app.route('/tiles/<style_name>/<int:z>/<int:x>/<int:y>.png')
 def serve_tile(style_name, z, x, y):
     """Serve a cached tile if it exists, checking both 8-bit and normal directories."""
+    # Validate tile coordinates
+    if not (0 <= z <= 19):
+        return 'Invalid zoom level (must be 0-19)', 400
+
+    max_coord = 2 ** z
+    if not (0 <= x < max_coord and 0 <= y < max_coord):
+        return f'Invalid tile coordinates for zoom {z} (must be 0-{max_coord-1})', 400
+
     # Try 8-bit first, then normal
     for convert_to_8bit in [True, False]:
         style_cache_dir = get_style_cache_dir(style_name, convert_to_8bit)
         tile_path = style_cache_dir / str(z) / str(x) / f"{y}.png"
-        
+
         if tile_path.exists():
             return send_file(tile_path)
-    
+
     return '', 404
 
 @app.route('/delete_cache/<style_name>', methods=['DELETE'])
@@ -683,6 +793,9 @@ def get_cached_tiles_route(style_name):
                     z = int(z_dir.name)
                     
                     # Filter by zoom level if specified
+                    # zoom_range parameter means "show tiles within ±zoom_range levels"
+                    # For zoom_range=1: shows current zoom ±1 (3 levels total)
+                    # For zoom_range=0: shows only current zoom (1 level)
                     if zoom is not None and abs(z - zoom) > zoom_range:
                         continue
                     
