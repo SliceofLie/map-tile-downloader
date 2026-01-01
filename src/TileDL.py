@@ -21,6 +21,7 @@ import threading
 from PIL import Image
 from collections import deque
 import logging
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,6 +55,12 @@ BATCH_SIZE = 100  # Process more tiles at once
 RATE_LIMIT_DETECTION_THRESHOLD = 5  # Number of 429s before throttling
 RATE_LIMIT_BACKOFF_SECONDS = 10  # Wait time when rate limited
 
+# Known error image hashes (MD5) - tiles matching these will abort the download
+ERROR_IMAGE_HASHES = {
+    '8F4F0F59FF1D5E6A55FF1AF91D65FC2E',  # Known error image
+    # Add more error image hashes here as they're discovered
+}
+
 # Session-specific state management
 class DownloadSession:
     """Manages state for a single download session."""
@@ -71,12 +78,16 @@ class DownloadSession:
         }
         self.rate_limit_counter = 0
         self.currently_throttled = False
+        self.error_image_detected = False
+        self.error_message = None
         
     def is_cancelled(self):
         return not self.cancel_event.is_set()
     
-    def cancel(self):
+    def cancel(self, error_message=None):
         self.cancel_event.clear()
+        if error_message:
+            self.error_message = error_message
     
     def update_stats(self, stat_type, count=1):
         with self.stats_lock:
@@ -149,6 +160,30 @@ def convert_image_to_8bit(tile_path):
     except Exception as e:
         logging.error(f"Error converting tile to 8-bit: {e}")
 
+def calculate_file_hash(file_path):
+    """Calculate MD5 hash of a file."""
+    md5_hash = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        # Read file in chunks to handle large files efficiently
+        for byte_block in iter(lambda: f.read(4096), b""):
+            md5_hash.update(byte_block)
+    return md5_hash.hexdigest().upper()
+
+def check_for_error_image(file_path, session_obj):
+    """Check if downloaded tile matches a known error image hash.
+    Returns True if error image detected, False otherwise."""
+    try:
+        file_hash = calculate_file_hash(file_path)
+        if file_hash in ERROR_IMAGE_HASHES:
+            error_msg = f"Error image detected (hash: {file_hash}). Map provider returned an error image instead of valid tile data."
+            logging.error(error_msg)
+            session_obj.cancel(error_msg)
+            session_obj.error_image_detected = True
+            return True
+    except Exception as e:
+        logging.error(f"Error checking tile hash: {e}")
+    return False
+
 def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj, http_session, normal_cache_dir=None):
     """Download a single tile with retry logic and rate limit handling."""
     if session_obj.is_cancelled():
@@ -205,6 +240,15 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
                     with open(normal_tile_path, 'wb') as f:
                         f.write(response.content)
                     
+                    # Check for error image before processing
+                    if check_for_error_image(normal_tile_path, session_obj):
+                        # Delete the error image and return error status
+                        try:
+                            os.remove(normal_tile_path)
+                        except:
+                            pass
+                        return {'status': 'error_image', 'tile': tile}
+                    
                     # Convert in-memory to avoid double I/O
                     tile_dir.mkdir(parents=True, exist_ok=True)
                     try:
@@ -221,6 +265,15 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, session_obj
                     tile_dir.mkdir(parents=True, exist_ok=True)
                     with open(tile_path, 'wb') as f:
                         f.write(response.content)
+                    
+                    # Check for error image
+                    if check_for_error_image(tile_path, session_obj):
+                        # Delete the error image and return error status
+                        try:
+                            os.remove(tile_path)
+                        except:
+                            pass
+                        return {'status': 'error_image', 'tile': tile}
                 
                 session_obj.update_stats('completed')
                 # Removed socket emission for downloaded tiles - reduces overhead dramatically
@@ -352,6 +405,13 @@ def download_tiles_optimized(tiles, map_style, style_cache_dir, convert_to_8bit,
             
             result = future.result()
             
+            # Check for error image detection
+            if result['status'] == 'error_image':
+                logging.error(f"Error image detected at tile {result['tile'].z}/{result['tile'].x}/{result['tile'].y}")
+                # Cancel all remaining downloads
+                session_obj.cancel(session_obj.error_message)
+                break
+            
             # Queue failed downloads for retry
             if result['status'] == 'failed' and len(retry_queue) < 1000:  # Limit retry queue size
                 retry_queue.append(result['tile'])
@@ -385,6 +445,14 @@ def download_tiles_optimized(tiles, map_style, style_cache_dir, convert_to_8bit,
     
     # Final progress update
     emit_progress_update(session_obj)
+    
+    # Check if download was cancelled due to error image
+    if session_obj.error_image_detected:
+        with app.app_context():
+            socketio.emit('error_image_detected', {
+                'message': session_obj.error_message
+            }, to=session_obj.session_id)
+        return
     
     if not session_obj.is_cancelled():
         with app.app_context():
@@ -536,7 +604,7 @@ def handle_cancel_download():
     """Handle cancellation of the download."""
     session_id = request.sid
     session_obj = get_session(session_id)
-    session_obj.cancel()
+    session_obj.cancel()  # User-initiated cancellation has no error message
     emit('download_cancelled')
 
 @app.route('/download_zip')

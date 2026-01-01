@@ -524,6 +524,13 @@
             document.getElementById('progress').innerHTML = 'Ready';
             alert('Download cancelled');
         });
+        
+        socket.on('error_image_detected', function(data) {
+            document.getElementById('cancelBtn').disabled = true;
+            downloadProgressLayer.clearLayers();
+            document.getElementById('progress').innerHTML = 'Ready';
+            alert('Download aborted: ' + data.message);
+        });
 
         socket.on('error', function(data) {
             alert(data.message);
